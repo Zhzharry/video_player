@@ -1,0 +1,6 @@
+# 新版界面（无 Qt / PySide6，推荐用于 PyInstaller）：python player_tk.py
+Pillow>=10.0.0
+python-vlc>=3.0.20123
+
+# 旧版（PySide6）：python "main copy.py" — 若已改用 player_tk 可删除下一行
+pyside6>=6.7.0
