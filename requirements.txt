@@ -1,6 +1,8 @@
-# 新版界面（无 Qt / PySide6，推荐用于 PyInstaller）：python player_tk.py
+# 图像处理与演示截图生成
 Pillow>=10.0.0
-python-vlc>=3.0.20123
 
-# 旧版（PySide6）：python "main copy.py" — 若已改用 player_tk 可删除下一行
+# 桌面播放器与灰度实验界面
 pyside6>=6.7.0
+
+# 保留给后续音视频工具扩展
+python-vlc>=3.0.20123

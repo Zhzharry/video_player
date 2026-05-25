@@ -1,4 +1,4 @@
-# PyInstaller runtime hook — runs before main script; complements _fix_frozen_qt_paths() in main copy.py
+# PyInstaller runtime hook — runs before main script; complements _fix_frozen_qt_paths() in main.py
 import os
 import sys
 

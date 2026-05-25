@@ -103,6 +103,17 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 
+from image_processing import (
+    ALGORITHM_FORMULAS,
+    ALGORITHM_LABELS,
+    ALGORITHMS,
+    GrayParams,
+    apply_gray_transform,
+    default_suffix,
+    histogram_256,
+)
+from qt_image_bridge import pil_to_qimage, qimage_to_pil
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".wmv"}
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".opus", ".wma"}
@@ -119,6 +130,18 @@ def ms_to_hhmmss(ms: int) -> str:
     if h > 0:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def ms_to_file_timestamp(ms: int) -> str:
+    if ms < 0:
+        ms = 0
+    total_ms = int(ms)
+    total_sec = total_ms // 1000
+    milli = total_ms % 1000
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    return f"{h:02d}-{m:02d}-{s:02d}_{milli:03d}"
 
 
 def clamp(v: int, lo: int, hi: int) -> int:
@@ -227,6 +250,94 @@ class ClickBlurFilter(QObject):
         return super().eventFilter(obj, event)
 
 
+class HistogramWidget(QWidget):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._original_hist: list[int] = [0] * 256
+        self._processed_hist: list[int] = [0] * 256
+        self._threshold: int | None = None
+        self.setMinimumHeight(220)
+
+    def set_histograms(
+        self,
+        original_hist: list[int],
+        processed_hist: list[int],
+        threshold: int | None = None,
+    ) -> None:
+        self._original_hist = list(original_hist[:256]) if original_hist else [0] * 256
+        self._processed_hist = list(processed_hist[:256]) if processed_hist else [0] * 256
+        self._threshold = threshold
+        self.update()
+
+    def clear(self) -> None:
+        self.set_histograms([0] * 256, [0] * 256, None)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.fillRect(self.rect(), QColor("#111114"))
+
+        margin = 12
+        gap = 22
+        label_h = 18
+        available_h = max(20, self.height() - margin * 2 - gap - label_h * 2)
+        graph_h = max(20, available_h // 2)
+        graph_w = max(40, self.width() - margin * 2)
+        top1 = margin + label_h
+        top2 = top1 + graph_h + gap + label_h
+
+        self._draw_one_histogram(
+            painter,
+            QRect(margin, top1, graph_w, graph_h),
+            "原图灰度直方图",
+            self._original_hist,
+        )
+        self._draw_one_histogram(
+            painter,
+            QRect(margin, top2, graph_w, graph_h),
+            "处理后直方图",
+            self._processed_hist,
+        )
+        painter.end()
+
+    def _draw_one_histogram(
+        self,
+        painter: QPainter,
+        rect: QRect,
+        title: str,
+        hist: list[int],
+    ) -> None:
+        title_rect = QRect(rect.left(), rect.top() - 18, rect.width(), 16)
+        painter.setPen(QColor("#d8d8d8"))
+        painter.drawText(title_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, title)
+
+        painter.setPen(QColor("#303036"))
+        painter.drawRect(rect)
+        max_value = max(hist) if hist else 0
+        if max_value <= 0:
+            painter.setPen(QColor("#777"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无直方图")
+            return
+
+        painter.setPen(QColor("#64b5f6"))
+        for x in range(rect.width()):
+            bin_index = min(255, int(x * 256 / max(1, rect.width())))
+            value = hist[bin_index]
+            bar_h = int(value / max_value * max(1, rect.height() - 2))
+            painter.drawLine(
+                rect.left() + x,
+                rect.bottom() - 1,
+                rect.left() + x,
+                rect.bottom() - 1 - bar_h,
+            )
+
+        if self._threshold is not None:
+            tx = rect.left() + int(clamp(self._threshold, 0, 255) / 255 * rect.width())
+            painter.setPen(QPen(QColor("#ffb74d"), 2))
+            painter.drawLine(tx, rect.top(), tx, rect.bottom())
+
+
 class PlayerWindow(QMainWindow):
     def __init__(self, config: PlayerConfig | None = None) -> None:
         super().__init__()
@@ -249,18 +360,30 @@ class PlayerWindow(QMainWindow):
         self._video = QVideoWidget(self)
         self._player.setVideoOutput(self._video)
         self._player.mediaStatusChanged.connect(self._on_media_status)
+        self._last_video_frame: QImage | None = None
+        try:
+            self._video.videoSink().videoFrameChanged.connect(self._on_video_frame_changed)
+        except AttributeError:
+            self._last_video_frame = None
 
         self._image = QLabel(self)
         self._image.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image.setText("拖拽文件到窗口，或按 O 打开")
         self._image.setStyleSheet("color: #9a9a9a;")
         self._image.setMinimumSize(320, 180)
+        self._image_original_preview = QLabel(self)
+        self._image_original_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._image_original_preview.setText("原图")
+        self._image_original_preview.setStyleSheet("color: #9a9a9a;")
+        self._image_original_preview.setMinimumSize(260, 180)
         self._image_pixmap: QPixmap | None = None
         self._image_path: str | None = None
         self._current_path: str | None = None  # current opened file path (image/audio/video)
         self._image_original: QPixmap | None = None
         self._image_original_img: QImage | None = None
         self._image_edit_img: QImage | None = None
+        self._gray_algorithm: str = "original"
+        self._gray_params = GrayParams()
         self._image_dirty: bool = False
         self._img_edited_ever: bool = False
         self._img_saved_once: bool = False
@@ -388,9 +511,47 @@ class PlayerWindow(QMainWindow):
         self._image_scroll.setWidget(self._image)
         self._image_scroll.setToolTip("放大后：用滚动条、鼠标中键拖动或 Alt+左键拖动平移画面")
 
+        self._original_scroll = QScrollArea(self)
+        self._original_scroll.setObjectName("ImageScrollArea")
+        self._original_scroll.setWidgetResizable(False)
+        self._original_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._original_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._original_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._original_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._original_scroll.setWidget(self._image_original_preview)
+
+        original_pane = QFrame(self)
+        original_pane.setObjectName("ImagePane")
+        original_layout = QVBoxLayout(original_pane)
+        original_layout.setContentsMargins(0, 0, 0, 0)
+        original_layout.setSpacing(6)
+        original_title = QLabel("原图", self)
+        original_title.setObjectName("PaneTitle")
+        original_layout.addWidget(original_title)
+        original_layout.addWidget(self._original_scroll, 1)
+
+        processed_pane = QFrame(self)
+        processed_pane.setObjectName("ImagePane")
+        processed_layout = QVBoxLayout(processed_pane)
+        processed_layout.setContentsMargins(0, 0, 0, 0)
+        processed_layout.setSpacing(6)
+        processed_title = QLabel("处理图", self)
+        processed_title.setObjectName("PaneTitle")
+        processed_layout.addWidget(processed_title)
+        processed_layout.addWidget(self._image_scroll, 1)
+
+        self._experiment_panel = self._build_experiment_panel()
+        self._image_compare_widget = QWidget(self)
+        image_compare_layout = QHBoxLayout(self._image_compare_widget)
+        image_compare_layout.setContentsMargins(0, 0, 0, 0)
+        image_compare_layout.setSpacing(10)
+        image_compare_layout.addWidget(original_pane, 1)
+        image_compare_layout.addWidget(processed_pane, 1)
+        image_compare_layout.addWidget(self._experiment_panel)
+
         self._viewer = QStackedWidget(self)
         self._viewer.addWidget(self._video)   # index 0
-        self._viewer.addWidget(self._image_scroll)   # index 1
+        self._viewer.addWidget(self._image_compare_widget)   # index 1
 
         self._focus_mode = False
         self._focus_btn = QToolButton(self)
@@ -416,6 +577,12 @@ class PlayerWindow(QMainWindow):
         self._open_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self._open_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton))
         self._open_btn.clicked.connect(self.open_file)
+
+        self._capture_frame_btn = QToolButton(self)
+        self._capture_frame_btn.setText("视频截图")
+        self._capture_frame_btn.setToolTip("截取当前视频帧并进入灰度实验")
+        self._capture_frame_btn.setEnabled(False)
+        self._capture_frame_btn.clicked.connect(self.capture_video_frame)
 
         self._play_btn = QToolButton(self)
         self._play_btn.setObjectName("RoundPlayButton")
@@ -560,6 +727,7 @@ class PlayerWindow(QMainWindow):
         topbar.addWidget(self._image_status_label)
         topbar.addWidget(QLabel("输出：", self))
         topbar.addWidget(self._audio_device)
+        topbar.addWidget(self._capture_frame_btn)
         topbar.addWidget(self._open_btn)
 
         # Row 1: progress (separate line)
@@ -643,6 +811,243 @@ class PlayerWindow(QMainWindow):
         self._devices = QMediaDevices(self)
         self._devices.audioOutputsChanged.connect(self._refresh_audio_devices)
 
+    def _build_experiment_panel(self) -> QFrame:
+        panel = QFrame(self)
+        panel.setObjectName("ExperimentPanel")
+        panel.setFixedWidth(340)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        title = QLabel("灰度变换实验", self)
+        title.setObjectName("ExperimentTitle")
+        layout.addWidget(title)
+
+        self._algorithm_combo = QComboBox(self)
+        for algorithm in ALGORITHMS:
+            self._algorithm_combo.addItem(ALGORITHM_LABELS.get(algorithm, algorithm), algorithm)
+        self._algorithm_combo.currentIndexChanged.connect(self._on_gray_algorithm_changed)
+        layout.addWidget(self._algorithm_combo)
+
+        self._experiment_scroll = QScrollArea(self)
+        self._experiment_scroll.setObjectName("ExperimentScrollArea")
+        self._experiment_scroll.setWidgetResizable(True)
+        self._experiment_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._experiment_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._experiment_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        scroll_content = QWidget(self._experiment_scroll)
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(12)
+
+        self._brightness_slider, self._brightness_value = self._add_slider_row(
+            scroll_layout, "亮度 b", -100, 100, 0
+        )
+        self._contrast_a_slider, self._contrast_a_value = self._add_slider_row(
+            scroll_layout, "对比度 a", 10, 300, 100, scale=100.0
+        )
+        self._contrast_b_slider, self._contrast_b_value = self._add_slider_row(
+            scroll_layout, "偏移 b", -100, 100, 0
+        )
+        self._threshold_slider, self._threshold_value = self._add_slider_row(
+            scroll_layout, "阈值 T", 0, 255, 128
+        )
+        self._gamma_slider, self._gamma_value = self._add_slider_row(
+            scroll_layout, "Gamma", 10, 500, 100, scale=100.0
+        )
+
+        self._formula_label = QLabel("", self)
+        self._formula_label.setObjectName("ExperimentInfo")
+        self._formula_label.setWordWrap(True)
+        scroll_layout.addWidget(self._formula_label)
+
+        self._result_info_label = QLabel("", self)
+        self._result_info_label.setObjectName("ExperimentInfo")
+        self._result_info_label.setWordWrap(True)
+        scroll_layout.addWidget(self._result_info_label)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        self._restore_original_btn = QToolButton(self)
+        self._restore_original_btn.setText("还原原图")
+        self._restore_original_btn.clicked.connect(self.restore_original_image)
+        self._save_processed_btn = QToolButton(self)
+        self._save_processed_btn.setText("保存处理结果")
+        self._save_processed_btn.clicked.connect(self._save_processed_image)
+        button_row.addWidget(self._restore_original_btn)
+        button_row.addWidget(self._save_processed_btn)
+        scroll_layout.addLayout(button_row)
+
+        self._histogram = HistogramWidget(scroll_content)
+        scroll_layout.addWidget(self._histogram)
+        scroll_layout.addStretch(1)
+        self._experiment_scroll.setWidget(scroll_content)
+        layout.addWidget(self._experiment_scroll, 1)
+        self._update_gray_control_labels()
+        self._update_gray_panel_text()
+        self._update_gray_control_enabled()
+        return panel
+
+    def _add_slider_row(
+        self,
+        parent_layout: QVBoxLayout,
+        title: str,
+        minimum: int,
+        maximum: int,
+        value: int,
+        scale: float = 1.0,
+    ) -> tuple[QSlider, QLabel]:
+        row = QWidget(self)
+        row.setObjectName("ParamRow")
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(8)
+        name = QLabel(title, self)
+        name.setMinimumWidth(70)
+        slider = QSlider(Qt.Orientation.Horizontal, self)
+        slider.setRange(minimum, maximum)
+        slider.setValue(value)
+        slider.setProperty("value_scale", scale)
+        value_label = QLabel("", self)
+        value_label.setMinimumWidth(42)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        slider.valueChanged.connect(self._on_gray_control_changed)
+        row_layout.addWidget(name)
+        row_layout.addWidget(slider, 1)
+        row_layout.addWidget(value_label)
+        parent_layout.addWidget(row)
+        return slider, value_label
+
+    def _gray_params_from_controls(self) -> GrayParams:
+        return GrayParams(
+            brightness=int(self._brightness_slider.value()),
+            contrast_a=float(self._contrast_a_slider.value()) / 100.0,
+            contrast_b=int(self._contrast_b_slider.value()),
+            threshold=int(self._threshold_slider.value()),
+            gamma=float(self._gamma_slider.value()) / 100.0,
+        )
+
+    def _on_gray_algorithm_changed(self, _index: int | None = None) -> None:
+        self._gray_algorithm = self._algorithm_combo.currentData() or "original"
+        self._update_gray_control_enabled()
+        self._apply_gray_settings()
+        if hasattr(self, "_experiment_scroll"):
+            self._experiment_scroll.verticalScrollBar().setValue(0)
+
+    def _on_gray_control_changed(self, _value: int | None = None) -> None:
+        self._gray_params = self._gray_params_from_controls()
+        self._update_gray_control_labels()
+        self._apply_gray_settings()
+
+    def _update_gray_control_labels(self) -> None:
+        if not hasattr(self, "_brightness_slider"):
+            return
+        self._brightness_value.setText(str(self._brightness_slider.value()))
+        self._contrast_a_value.setText(f"{self._contrast_a_slider.value() / 100.0:.2f}")
+        self._contrast_b_value.setText(str(self._contrast_b_slider.value()))
+        self._threshold_value.setText(str(self._threshold_slider.value()))
+        self._gamma_value.setText(f"{self._gamma_slider.value() / 100.0:.2f}")
+
+    def _update_gray_control_enabled(self) -> None:
+        if not hasattr(self, "_brightness_slider"):
+            return
+        algorithm = self._gray_algorithm
+        self._brightness_slider.setEnabled(algorithm == "brightness")
+        self._contrast_a_slider.setEnabled(algorithm == "contrast")
+        self._contrast_b_slider.setEnabled(algorithm == "contrast")
+        self._threshold_slider.setEnabled(algorithm == "threshold")
+        self._gamma_slider.setEnabled(algorithm == "gamma")
+
+    def _update_gray_panel_text(self) -> None:
+        if not hasattr(self, "_formula_label"):
+            return
+        algorithm = self._gray_algorithm
+        params = self._gray_params
+        label = ALGORITHM_LABELS.get(algorithm, algorithm)
+        formula = ALGORITHM_FORMULAS.get(algorithm, "")
+        self._formula_label.setText(f"{label}\n{formula}")
+        if self._image_edit_img and not self._image_edit_img.isNull():
+            size_text = f"{self._image_edit_img.width()} x {self._image_edit_img.height()}"
+        else:
+            size_text = "未打开图片"
+        param_text = (
+            f"亮度 b={params.brightness}, 对比度 a={params.contrast_a:.2f}, "
+            f"偏移 b={params.contrast_b}, 阈值 T={params.threshold}, Gamma={params.gamma:.2f}"
+        )
+        self._result_info_label.setText(f"尺寸：{size_text}\n参数：{param_text}")
+
+    def _reset_gray_controls(self) -> None:
+        self._gray_algorithm = "original"
+        self._gray_params = GrayParams()
+        widgets = (
+            self._algorithm_combo,
+            self._brightness_slider,
+            self._contrast_a_slider,
+            self._contrast_b_slider,
+            self._threshold_slider,
+            self._gamma_slider,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        self._algorithm_combo.setCurrentIndex(0)
+        self._brightness_slider.setValue(self._gray_params.brightness)
+        self._contrast_a_slider.setValue(int(self._gray_params.contrast_a * 100))
+        self._contrast_b_slider.setValue(self._gray_params.contrast_b)
+        self._threshold_slider.setValue(self._gray_params.threshold)
+        self._gamma_slider.setValue(int(self._gray_params.gamma * 100))
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._update_gray_control_labels()
+        self._update_gray_control_enabled()
+        self._update_gray_panel_text()
+
+    def _apply_gray_settings(self) -> None:
+        if not self._image_original_img or self._image_original_img.isNull():
+            self._update_gray_panel_text()
+            return
+        try:
+            source = qimage_to_pil(self._image_original_img)
+            if self._gray_algorithm == "original":
+                processed = source.copy()
+            else:
+                processed = apply_gray_transform(source, self._gray_algorithm, self._gray_params)
+            self._image_edit_img = pil_to_qimage(processed).convertToFormat(QImage.Format.Format_ARGB32)
+        except Exception as exc:
+            QMessageBox.warning(self, "图像处理失败", str(exc))
+            return
+
+        self._image_pixmap = QPixmap.fromImage(self._image_edit_img)
+        self._image_dirty = self._gray_algorithm != "original"
+        self._img_edited_ever = self._gray_algorithm != "original"
+        self._img_saved_once = False
+        self._reset_undo_stack()
+        self._render_image()
+        self._refresh_image_status_ui()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
+
+    def _refresh_histogram_ui(self) -> None:
+        if not hasattr(self, "_histogram"):
+            return
+        if (
+            not self._image_original_img
+            or self._image_original_img.isNull()
+            or not self._image_edit_img
+            or self._image_edit_img.isNull()
+        ):
+            self._histogram.clear()
+            return
+        try:
+            original_hist = histogram_256(qimage_to_pil(self._image_original_img))
+            processed_hist = histogram_256(qimage_to_pil(self._image_edit_img))
+        except Exception:
+            self._histogram.clear()
+            return
+        threshold = self._gray_params.threshold if self._gray_algorithm == "threshold" else None
+        self._histogram.set_histograms(original_hist, processed_hist, threshold)
+
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
@@ -677,7 +1082,58 @@ class PlayerWindow(QMainWindow):
             QLabel#FileLabel { color: #bdbdbd; }
             QFrame#Card { background: #111114; border: 1px solid #222; border-radius: 14px; }
             QFrame#DrawPanel { background: #141416; border: 1px solid #222; border-radius: 12px; }
+            QFrame#ImagePane { background: transparent; border: none; }
+            QLabel#PaneTitle {
+              color: #d8d8d8;
+              font-weight: 700;
+              padding: 0 2px;
+            }
+            QFrame#ExperimentPanel {
+              background: #141416;
+              border: 1px solid #24242a;
+              border-radius: 12px;
+            }
+            QLabel#ExperimentTitle {
+              color: #f0f0f0;
+              font-size: 15px;
+              font-weight: 800;
+            }
+            QLabel#ExperimentInfo {
+              color: #cfcfcf;
+              line-height: 140%;
+              padding: 6px 0;
+            }
             QScrollArea#ImageScrollArea { background: transparent; border: none; }
+            QScrollArea#ExperimentScrollArea {
+              background: transparent;
+              border: none;
+            }
+            QScrollArea#ExperimentScrollArea > QWidget > QWidget {
+              background: transparent;
+            }
+            QScrollArea#ExperimentScrollArea QScrollBar:vertical {
+              width: 8px;
+              background: transparent;
+              margin: 0;
+            }
+            QScrollArea#ExperimentScrollArea QScrollBar::handle:vertical {
+              background: #33343a;
+              border-radius: 4px;
+              min-height: 28px;
+            }
+            QScrollArea#ExperimentScrollArea QScrollBar::handle:vertical:hover {
+              background: #454750;
+            }
+            QScrollArea#ExperimentScrollArea QScrollBar::add-line:vertical,
+            QScrollArea#ExperimentScrollArea QScrollBar::sub-line:vertical {
+              height: 0;
+              border: none;
+              background: transparent;
+            }
+            QScrollArea#ExperimentScrollArea QScrollBar::add-page:vertical,
+            QScrollArea#ExperimentScrollArea QScrollBar::sub-page:vertical {
+              background: transparent;
+            }
             QToolButton#ImageToolButton:checked {
               background: #23324a;
               border: 1px solid #4b9cff;
@@ -966,6 +1422,7 @@ class PlayerWindow(QMainWindow):
     def resizeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
         super().resizeEvent(event)
         if self._mode == "image":
+            self._render_original_preview()
             self._render_image()
 
     def _on_error(self, error, error_string: str) -> None:
@@ -1022,6 +1479,12 @@ class PlayerWindow(QMainWindow):
             self._viewer.setCurrentIndex(0)
             self._play_btn.setEnabled(True)
             self._pos_slider.setEnabled(True)
+        is_video = bool(
+            self._current_path
+            and os.path.splitext(self._current_path)[1].lower() in VIDEO_EXTS
+            and mode == "media"
+        )
+        self._capture_frame_btn.setEnabled(is_video)
         self._refresh_nav_enabled()
         self._refresh_image_status_ui()
 
@@ -1037,6 +1500,7 @@ class PlayerWindow(QMainWindow):
         self._image_original = QPixmap(pm)
         self._image_original_img = pm.toImage().convertToFormat(QImage.Format.Format_ARGB32)
         self._image_edit_img = QImage(self._image_original_img)
+        self._reset_gray_controls()
         self._image_dirty = False
         self._img_edited_ever = False
         self._img_saved_once = False
@@ -1048,7 +1512,10 @@ class PlayerWindow(QMainWindow):
         self._set_zoom(1.0)
         self._set_crop_mode(False)
         self._crop_btn.setChecked(False)
+        self._render_original_preview()
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         base = os.path.basename(file_path)
         self._file_label.setText(base)
         self.setWindowTitle(f"播放器 - {base}")
@@ -1057,7 +1524,7 @@ class PlayerWindow(QMainWindow):
         if not self._image_pixmap or self._image_pixmap.isNull():
             return
         # Fit inside viewer area; avoid upscaling too much for tiny images.
-        target = self._viewer.size()
+        target = self._image_scroll.viewport().size()
         if target.width() <= 0 or target.height() <= 0:
             return
         img = self._image_pixmap
@@ -1099,9 +1566,31 @@ class PlayerWindow(QMainWindow):
         self._image.setPixmap(scaled)
         self._image.setFixedSize(scaled.size())
 
+    def _render_original_preview(self) -> None:
+        if not self._image_original or self._image_original.isNull():
+            return
+        target = self._original_scroll.viewport().size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        img = self._image_original
+        img_w = img.width()
+        img_h = img.height()
+        if img_w <= 0 or img_h <= 0:
+            return
+        scale = min(target.width() / img_w, target.height() / img_h)
+        scale = max(0.05, min(1.0, scale))
+        disp_w = max(1, int(img_w * scale))
+        disp_h = max(1, int(img_h * scale))
+        scaled = img.scaled(disp_w, disp_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        self._image_original_preview.setPixmap(scaled)
+        self._image_original_preview.setFixedSize(scaled.size())
+
     def _open_media(self, file_path: str) -> None:
+        self._last_video_frame = None
         self._image_pixmap = None
         self._image.clear()
+        self._image_original_preview.clear()
+        self._image_original_preview.setText("原图")
         self._image_path = None
         self._current_path = file_path
         self._image_original = None
@@ -1113,6 +1602,9 @@ class PlayerWindow(QMainWindow):
         self._image_status_banner = ""
         self._undo_stack = []
         self._undo_index = -1
+        if hasattr(self, "_histogram"):
+            self._histogram.clear()
+        self._update_gray_panel_text()
         self._set_mode("media")
         self._draw_panel.setVisible(False)
         self._set_crop_mode(False)
@@ -1167,6 +1659,45 @@ class PlayerWindow(QMainWindow):
             self._step_same_type_in_folder(+1, shuffle=True)
             return
         self._step_same_type_in_folder(+1)
+
+    def _on_video_frame_changed(self, frame) -> None:
+        if frame is None or not frame.isValid():
+            return
+        image = frame.toImage()
+        if image.isNull():
+            return
+        self._last_video_frame = image.copy()
+
+    def capture_video_frame(self) -> None:
+        if not self._current_path or os.path.splitext(self._current_path)[1].lower() not in VIDEO_EXTS:
+            QMessageBox.information(self, "无法截图", "请先打开视频文件。")
+            return
+        frame_image = self._last_video_frame
+        if frame_image is None or frame_image.isNull():
+            try:
+                current_frame = self._video.videoSink().videoFrame()
+                frame_image = current_frame.toImage()
+            except Exception:
+                frame_image = None
+        if frame_image is None or frame_image.isNull():
+            QMessageBox.information(self, "暂无视频帧", "请先播放视频或暂停到目标画面后再截图。")
+            return
+
+        folder = os.path.dirname(self._current_path)
+        root = os.path.splitext(os.path.basename(self._current_path))[0]
+        timestamp = ms_to_file_timestamp(self._player.position())
+        out_path = os.path.join(folder, f"{root}_frame_{timestamp}.png")
+        if os.path.exists(out_path):
+            base = os.path.join(folder, f"{root}_frame_{timestamp}")
+            index = 1
+            while os.path.exists(f"{base}_{index}.png"):
+                index += 1
+            out_path = f"{base}_{index}.png"
+
+        if not frame_image.save(out_path):
+            QMessageBox.warning(self, "截图失败", "无法保存当前视频帧。")
+            return
+        self.open_path(out_path)
 
     def _classify_path_kind(self, path: str) -> str:
         ext = os.path.splitext(path)[1].lower()
@@ -1335,24 +1866,31 @@ class PlayerWindow(QMainWindow):
         elif chosen == act_gray:
             self._apply_image_transform("gray")
         elif chosen == act_reset:
-            self._apply_image_transform("reset")
+            self.restore_original_image()
         elif chosen == act_save_as:
             self._save_image_as()
+
+    def restore_original_image(self) -> None:
+        if not self._image_original_img or self._image_original_img.isNull():
+            return
+        self._image_edit_img = QImage(self._image_original_img)
+        self._image_pixmap = QPixmap.fromImage(self._image_edit_img)
+        self._reset_gray_controls()
+        self._image_dirty = False
+        self._img_edited_ever = False
+        self._img_saved_once = False
+        self._reset_undo_stack()
+        self._render_original_preview()
+        self._render_image()
+        self._refresh_histogram_ui()
+        self._refresh_image_status_ui()
 
     def _apply_image_transform(self, kind: str) -> None:
         if not self._image_edit_img or self._image_edit_img.isNull():
             return
         self._push_undo()
         if kind == "reset":
-            if self._image_original_img and not self._image_original_img.isNull():
-                self._image_edit_img = QImage(self._image_original_img)
-                self._image_pixmap = QPixmap.fromImage(self._image_edit_img)
-                self._image_dirty = False
-                self._img_edited_ever = False
-                self._img_saved_once = False
-                self._reset_undo_stack()
-                self._render_image()
-                self._refresh_image_status_ui()
+            self.restore_original_image()
             return
 
         pm = QPixmap.fromImage(self._image_edit_img)
@@ -1365,8 +1903,8 @@ class PlayerWindow(QMainWindow):
         elif kind == "flip_v":
             pm = pm.transformed(QTransform().scale(1, -1))
         elif kind == "gray":
-            img = pm.toImage().convertToFormat(pm.toImage().Format.Format_Grayscale8)
-            pm = QPixmap.fromImage(img)
+            img = apply_gray_transform(qimage_to_pil(self._image_edit_img), "grayscale", self._gray_params)
+            pm = QPixmap.fromImage(pil_to_qimage(img))
         else:
             return
 
@@ -1375,15 +1913,21 @@ class PlayerWindow(QMainWindow):
         self._image_dirty = True
         self._img_edited_ever = True
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         self._refresh_image_status_ui()
 
     def _default_image_save_path(self) -> str:
         if self._image_path:
             base = os.path.basename(self._image_path)
-            root, ext = os.path.splitext(base)
+            root, _ext = os.path.splitext(base)
             folder = os.path.dirname(self._image_path)
-            return os.path.join(folder, f"{root}_edited{ext or '.png'}")
+            suffix = default_suffix(self._gray_algorithm) if self._gray_algorithm != "original" else "_edited"
+            return os.path.join(folder, f"{root}{suffix}.png")
         return os.path.join(os.path.expanduser("~"), "image_edited.png")
+
+    def _save_processed_image(self) -> bool:
+        return self._save_image_as()
 
     def _save_image_as(self) -> bool:
         if self._mode != "image" or not self._image_pixmap or self._image_pixmap.isNull():
@@ -1402,10 +1946,6 @@ class PlayerWindow(QMainWindow):
             return False
         self._image_dirty = False
         self._img_saved_once = True
-        self._image_path = out_path
-        base = os.path.basename(out_path)
-        self._file_label.setText(base)
-        self.setWindowTitle(f"播放器 - {base}")
         self._refresh_image_status_ui()
         return True
 
@@ -1414,10 +1954,13 @@ class PlayerWindow(QMainWindow):
             self._image_edit_img = QImage(self._image_original_img)
             self._image_pixmap = QPixmap.fromImage(self._image_edit_img)
             self._reset_undo_stack()
+            self._reset_gray_controls()
         self._image_dirty = False
         self._img_edited_ever = False
         self._img_saved_once = False
+        self._render_original_preview()
         self._render_image()
+        self._refresh_histogram_ui()
         self._refresh_image_status_ui()
 
     def _refresh_image_status_ui(self) -> None:
@@ -1721,6 +2264,8 @@ class PlayerWindow(QMainWindow):
         self._image_dirty = True
         self._img_edited_ever = True
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         self._refresh_image_status_ui()
         # keep crop mode on, but clear rectangle
         self._crop_start = None
@@ -1764,6 +2309,8 @@ class PlayerWindow(QMainWindow):
             self._image_dirty = True
             self._img_edited_ever = True
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         self._refresh_image_status_ui()
 
     def image_redo(self) -> None:
@@ -1782,6 +2329,8 @@ class PlayerWindow(QMainWindow):
             self._image_dirty = True
             self._img_edited_ever = True
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         self._refresh_image_status_ui()
 
     def _draw_segment(self, a: QPoint, b: QPoint) -> None:
@@ -1822,6 +2371,8 @@ class PlayerWindow(QMainWindow):
         self._image_dirty = True
         self._img_edited_ever = True
         self._render_image()
+        self._refresh_histogram_ui()
+        self._update_gray_panel_text()
         self._refresh_image_status_ui()
 
     def _step_rate(self, delta: float) -> None:
@@ -1884,4 +2435,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
